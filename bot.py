@@ -1,50 +1,129 @@
+"""
+🐕🐕🐕 Drax — Bot Cérbero fofo para Discord (arquivo único, com configuração persistente)
+
+Requisitos:
+    pip install discord.py python-dotenv
+
+Configuração (.env na mesma pasta):
+    DISCORD_TOKEN=seu_token_aqui
+
+Uso:
+    python drax.py
+
+--------------------------------------------------------------------------
+ARMAZENAMENTO PERSISTENTE (Railway Volume)
+--------------------------------------------------------------------------
+O Drax guarda toda a configuração (quais canais usar, quais cargos aparecem
+no painel de registro, qual cargo é dado ao aceitar as regras) num arquivo
+JSON. Isso é necessário porque, sem um Volume, o sistema de arquivos do
+Railway é apagado a cada novo deploy/restart.
+
+Se você já anexou um Volume ao serviço no Railway (Settings > Volumes), ele
+cria SOZINHO a variável de ambiente RAILWAY_VOLUME_MOUNT_PATH apontando pro
+caminho montado (ex: /data). O Drax detecta essa variável automaticamente e
+salva o arquivo de configuração lá dentro — não precisa configurar nada a
+mais. Rodando localmente (sem Railway), ele só salva o arquivo na pasta
+atual mesmo.
+
+--------------------------------------------------------------------------
+COMANDOS (precisam de permissão de administração no servidor)
+--------------------------------------------------------------------------
+/configurar-canal tipo:<Boas-vindas|Saídas|Regras|Registro> canal:#canal
+    -> Define qual canal o Drax usa pra cada função. Fica salvo, e se for o
+       canal de Regras ou Registro, o painel já é postado/atualizado ali na hora.
+
+/adicionar-cargo-registro texto_botao:"Gamer" cargo:@Gamer emoji:🎮 estilo:Azul
+    -> Adiciona (ou atualiza) um botão no painel de registro. O painel já
+       existente é atualizado automaticamente, sem precisar reenviar nada.
+
+/remover-cargo-registro texto_botao:"Gamer"
+    -> Remove um botão do painel de registro (atualiza na hora também).
+
+/definir-cargo-verificado cargo:@Verificado
+    -> Define qual cargo é dado a quem clica em "concordo com as regras".
+
+/ver-configuracao
+    -> Mostra a configuração atual (canais e cargos salvos).
+
+/painel-registro e /painel-regras
+    -> Forçam um novo post manual dos painéis no canal atual (opcional).
+"""
 
 import os
+import json
 import logging
+from pathlib import Path
 from typing import Optional
+
 import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 
 # ============================================================
-# CONFIGURAÇÕES — edite aqui pra personalizar o Drax
+# TOKEN
 # ============================================================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# IDs dos canais (clique com botão direito no canal no Discord > Copiar ID
-# precisa do "Modo desenvolvedor" ativado em Configurações > Avançado)
-CANAL_BOAS_VINDAS_ID = 1527366588762951701
-CANAL_SAIDAS_ID = 1527366588762951702
-CANAL_REGRAS_ID = 1527366588762951704
-CANAL_REGISTRO_ID = 1527394849953681541
+# ============================================================
+# ARMAZENAMENTO PERSISTENTE DA CONFIGURAÇÃO
+# ============================================================
+# No Railway, anexar um Volume cria sozinho essa variável apontando pro
+# caminho montado. Rodando local, cai na pasta atual mesmo.
+DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
+ARQUIVO_CONFIG = Path(DATA_DIR) / "drax_config.json"
+
+# Configuração usada apenas na primeira vez que o bot roda (antes de existir
+# o arquivo salvo). Depois disso, tudo é editado pelos comandos no Discord.
+CONFIG_PADRAO = {
+    "canal_boas_vindas_id": 1527366588762951701,
+    "canal_saidas_id": 1527366588762951702,
+    "canal_regras_id": 1527366588762951704,
+    "canal_registro_id": 1527394849953681541,
+    "cargo_verificado": "Verificado",
+    "cargos_registro": {
+        "Gamer": {"cargo": "Gamer", "emoji": "🎮", "estilo": "primary"},
+        "Artista": {"cargo": "Artista", "emoji": "🎨", "estilo": "secondary"},
+        "Música": {"cargo": "Música", "emoji": "🎵", "estilo": "success"},
+        "Anime": {"cargo": "Anime", "emoji": "🍥", "estilo": "danger"},
+    },
+    "texto_regras": (
+        "1️⃣ Respeite todo mundo, sem exceções.\n"
+        "2️⃣ Nada de spam, flood ou propaganda sem permissão.\n"
+        "3️⃣ Proibido conteúdo NSFW.\n"
+        "4️⃣ Sem discurso de ódio ou preconceito.\n"
+        "5️⃣ Siga os Termos de Serviço do Discord."
+    ),
+}
+
+
+def carregar_config() -> dict:
+    if ARQUIVO_CONFIG.exists():
+        try:
+            with open(ARQUIVO_CONFIG, "r", encoding="utf-8") as f:
+                salvo = json.load(f)
+            # mescla com o padrão, assim campos novos adicionados no código no futuro
+            # não quebram uma configuração salva antiga
+            cfg = {**CONFIG_PADRAO, **salvo}
+            cfg["cargos_registro"] = salvo.get("cargos_registro", CONFIG_PADRAO["cargos_registro"])
+            return cfg
+        except Exception as e:
+            print(f"⚠️ Não consegui ler {ARQUIVO_CONFIG}, usando configuração padrão. Erro: {e}")
+    return json.loads(json.dumps(CONFIG_PADRAO))  # cópia profunda do padrão
+
+
+def salvar_config():
+    ARQUIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with open(ARQUIVO_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    print(f"💾 Configuração salva em {ARQUIVO_CONFIG}")
+
+
+config = carregar_config()
 
 # Cor lateral dos embeds (tema "fogo do submundo")
 COR_EMBED = 0xFF6A00
-
-# Cargo dado a quem clica em "concordo com as regras". Precisa existir no servidor com esse nome exato.
-CARGO_VERIFICADO = "Verificado"
-
-# Cargos auto-atribuíveis no painel de registro.
-# "cargo"  -> nome EXATO do cargo no servidor (crie os cargos antes de rodar o bot!)
-# "emoji"  -> emoji do botão
-# "estilo" -> "primary" (azul) / "secondary" (cinza) / "success" (verde) / "danger" (vermelho)
-CARGOS_REGISTRO = {
-    "Gamer": {"cargo": "Gamer", "emoji": "🎮", "estilo": "primary"},
-    "Artista": {"cargo": "Artista", "emoji": "🎨", "estilo": "secondary"},
-    "Música": {"cargo": "Música", "emoji": "🎵", "estilo": "success"},
-    "Anime": {"cargo": "Anime", "emoji": "🍥", "estilo": "danger"},
-}
-
-TEXTO_REGRAS = (
-    "1️⃣ Respeite todo mundo, sem exceções.\n"
-    "2️⃣ Nada de spam, flood ou propaganda sem permissão.\n"
-    "3️⃣ Proibido conteúdo NSFW.\n"
-    "4️⃣ Sem discurso de ódio ou preconceito.\n"
-    "5️⃣ Siga os Termos de Serviço do Discord.\n\n"
-    "*(edite esse texto aqui em cima, na variável TEXTO_REGRAS)*"
-)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -103,11 +182,11 @@ class BotaoCargo(discord.ui.Button):
 
 
 class PainelRegistro(discord.ui.View):
-    """View persistente com um botão para cada cargo definido em CARGOS_REGISTRO."""
+    """View persistente com um botão para cada cargo em config['cargos_registro'] (lido na hora)."""
 
     def __init__(self):
         super().__init__(timeout=None)
-        for texto, dados in CARGOS_REGISTRO.items():
+        for texto, dados in config["cargos_registro"].items():
             self.add_item(BotaoCargo(texto, dados))
 
 
@@ -124,10 +203,10 @@ class BotaoAceitarRegras(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        cargo = discord.utils.get(interaction.guild.roles, name=CARGO_VERIFICADO)
+        cargo = discord.utils.get(interaction.guild.roles, name=config["cargo_verificado"])
         if cargo is None:
             await interaction.response.send_message(
-                f"🐾 Não achei o cargo **{CARGO_VERIFICADO}**. "
+                f"🐾 Não achei o cargo **{config['cargo_verificado']}**. "
                 f"Peça pra um admin criar um cargo com esse nome exato.",
                 ephemeral=True,
             )
@@ -150,7 +229,7 @@ class PainelRegras(discord.ui.View):
 
 
 # ============================================================
-# EMBEDS DOS PAINÉIS — funções reaproveitadas no auto-post e nos comandos
+# EMBEDS DOS PAINÉIS
 # ============================================================
 def montar_embed_registro() -> discord.Embed:
     embed = discord.Embed(
@@ -169,24 +248,26 @@ def montar_embed_regras() -> discord.Embed:
     return discord.Embed(
         title="📜 Regras do Servidor",
         description=(
-            TEXTO_REGRAS
+            config["texto_regras"]
             + "\n\nClique no botão abaixo pra confirmar que leu e concorda. Assim o Drax libera seu acesso! 🐾"
         ),
         color=COR_EMBED,
     )
 
 
-async def garantir_painel(canal: Optional[discord.TextChannel], view: discord.ui.View, embed: discord.Embed):
-    """Posta o painel no canal, mas só se ainda não existir um igual (evita duplicar a cada restart)."""
+async def atualizar_ou_criar_painel(canal: Optional[discord.TextChannel], view: discord.ui.View, embed: discord.Embed):
+    """Se já existir um painel com esse título no canal, edita a mensagem. Senão, posta uma nova."""
     if canal is None:
-        print(f"⚠️ Canal não encontrado. Confira se o ID em CANAL_*_ID está correto e se o Drax tem acesso a ele.")
+        print("⚠️ Canal não encontrado. Confira o ID configurado (/ver-configuracao) e o acesso do Drax a ele.")
         return
     try:
         async for msg in canal.history(limit=50):
             if msg.author == bot.user and msg.embeds and msg.embeds[0].title == embed.title:
-                return  # painel já existe, não duplica
+                await msg.edit(embed=embed, view=view)
+                print(f"🔄 Painel '{embed.title}' atualizado em #{canal.name}.")
+                return
     except discord.Forbidden:
-        print(f"⚠️ Sem permissão para ler o histórico de #{canal.name}. Dando 'Ver Histórico de Mensagens' ao Drax.")
+        print(f"⚠️ Sem permissão pra ler o histórico de #{canal.name}. Dê 'Ver Histórico de Mensagens' ao Drax.")
         return
     await canal.send(embed=embed, view=view)
     print(f"🐾 Painel '{embed.title}' postado em #{canal.name}.")
@@ -197,12 +278,12 @@ async def garantir_painel(canal: Optional[discord.TextChannel], view: discord.ui
 # ============================================================
 @bot.event
 async def on_member_join(member: discord.Member):
-    canal = bot.get_channel(CANAL_BOAS_VINDAS_ID)
+    canal = bot.get_channel(config["canal_boas_vindas_id"])
     if canal is None:
         return
 
-    canal_regras = bot.get_channel(CANAL_REGRAS_ID)
-    canal_registro = bot.get_channel(CANAL_REGISTRO_ID)
+    canal_regras = bot.get_channel(config["canal_regras_id"])
+    canal_registro = bot.get_channel(config["canal_registro_id"])
     regras_txt = canal_regras.mention if canal_regras else "as regras do servidor"
     registro_txt = canal_registro.mention if canal_registro else "o canal de registro"
 
@@ -225,7 +306,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    canal = bot.get_channel(CANAL_SAIDAS_ID)
+    canal = bot.get_channel(config["canal_saidas_id"])
     if canal is None:
         return
 
@@ -241,21 +322,145 @@ async def on_member_remove(member: discord.Member):
 
 
 # ============================================================
-# COMANDOS SLASH — postar os painéis
+# COMANDOS SLASH — configuração dinâmica (fica salva no volume)
 # ============================================================
+CHAVES_POR_TIPO = {
+    "Boas-vindas": "canal_boas_vindas_id",
+    "Saídas": "canal_saidas_id",
+    "Regras": "canal_regras_id",
+    "Registro": "canal_registro_id",
+}
+
+
+@bot.tree.command(name="configurar-canal", description="Define qual canal o Drax usa para cada função (fica salvo)")
+@app_commands.describe(tipo="Qual função configurar", canal="O canal a ser usado")
+@app_commands.choices(tipo=[app_commands.Choice(name=nome, value=chave) for nome, chave in CHAVES_POR_TIPO.items()])
+@app_commands.checks.has_permissions(manage_guild=True)
+async def configurar_canal(interaction: discord.Interaction, tipo: app_commands.Choice[str], canal: discord.TextChannel):
+    config[tipo.value] = canal.id
+    salvar_config()
+
+    await interaction.response.send_message(
+        f"✅ Canal de **{tipo.name}** configurado para {canal.mention}! Isso já ficou salvo — "
+        f"mesmo reiniciando o bot (ou fazendo redeploy no Railway), continua assim. 💾",
+        ephemeral=True,
+    )
+
+    if tipo.value == "canal_regras_id":
+        await atualizar_ou_criar_painel(canal, PainelRegras(), montar_embed_regras())
+    elif tipo.value == "canal_registro_id":
+        await atualizar_ou_criar_painel(canal, PainelRegistro(), montar_embed_registro())
+
+
 @bot.tree.command(
-    name="painel-registro",
-    description="Força um novo post do painel de registro de cargos do Drax no canal atual",
+    name="adicionar-cargo-registro",
+    description="Adiciona (ou atualiza) um botão de cargo no painel de registro",
 )
+@app_commands.describe(
+    texto_botao="Texto que aparece no botão (ex: Gamer)",
+    cargo="Cargo do servidor que será dado/removido ao clicar",
+    emoji="Emoji do botão (opcional, ex: 🎮)",
+    estilo="Cor do botão",
+)
+@app_commands.choices(
+    estilo=[
+        app_commands.Choice(name="Azul", value="primary"),
+        app_commands.Choice(name="Cinza", value="secondary"),
+        app_commands.Choice(name="Verde", value="success"),
+        app_commands.Choice(name="Vermelho", value="danger"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_roles=True)
+async def adicionar_cargo_registro(
+    interaction: discord.Interaction,
+    texto_botao: str,
+    cargo: discord.Role,
+    emoji: Optional[str] = None,
+    estilo: Optional[app_commands.Choice[str]] = None,
+):
+    config["cargos_registro"][texto_botao] = {
+        "cargo": cargo.name,
+        "emoji": emoji,
+        "estilo": estilo.value if estilo else "secondary",
+    }
+    salvar_config()
+
+    await interaction.response.send_message(
+        f"✅ Botão **{texto_botao}** ligado ao cargo **{cargo.name}** salvo! "
+        f"O painel de registro já foi atualizado. 🐾",
+        ephemeral=True,
+    )
+
+    canal_registro = bot.get_channel(config["canal_registro_id"])
+    await atualizar_ou_criar_painel(canal_registro, PainelRegistro(), montar_embed_registro())
+
+
+@bot.tree.command(name="remover-cargo-registro", description="Remove um botão de cargo do painel de registro")
+@app_commands.describe(texto_botao="Texto exato do botão a remover (igual está no painel)")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def remover_cargo_registro(interaction: discord.Interaction, texto_botao: str):
+    if texto_botao not in config["cargos_registro"]:
+        await interaction.response.send_message(
+            f"🐾 Não achei nenhum botão chamado **{texto_botao}**. Use /ver-configuracao pra ver os botões atuais.",
+            ephemeral=True,
+        )
+        return
+
+    del config["cargos_registro"][texto_botao]
+    salvar_config()
+
+    await interaction.response.send_message(f"🗑️ Botão **{texto_botao}** removido e já salvo!", ephemeral=True)
+
+    canal_registro = bot.get_channel(config["canal_registro_id"])
+    await atualizar_ou_criar_painel(canal_registro, PainelRegistro(), montar_embed_registro())
+
+
+@bot.tree.command(name="definir-cargo-verificado", description="Define qual cargo é dado a quem aceita as regras")
+@app_commands.describe(cargo="Cargo dado a quem concorda com as regras")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def definir_cargo_verificado(interaction: discord.Interaction, cargo: discord.Role):
+    config["cargo_verificado"] = cargo.name
+    salvar_config()
+    await interaction.response.send_message(
+        f"✅ Cargo de verificação definido como **{cargo.name}** e salvo!", ephemeral=True
+    )
+
+
+@bot.tree.command(name="ver-configuracao", description="Mostra a configuração atual do Drax (canais e cargos salvos)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ver_configuracao(interaction: discord.Interaction):
+    def fmt_canal(chave: str) -> str:
+        canal = bot.get_channel(config[chave])
+        return canal.mention if canal else f"⚠️ não encontrado (ID {config[chave]})"
+
+    cargos_txt = (
+        "\n".join(
+            f"• **{texto}** → cargo `{dados['cargo']}` {dados.get('emoji') or ''}"
+            for texto, dados in config["cargos_registro"].items()
+        )
+        or "_nenhum cargo configurado_"
+    )
+
+    embed = discord.Embed(title="⚙️ Configuração atual do Drax", color=COR_EMBED)
+    embed.add_field(name="Boas-vindas", value=fmt_canal("canal_boas_vindas_id"), inline=True)
+    embed.add_field(name="Saídas", value=fmt_canal("canal_saidas_id"), inline=True)
+    embed.add_field(name="Regras", value=fmt_canal("canal_regras_id"), inline=True)
+    embed.add_field(name="Registro", value=fmt_canal("canal_registro_id"), inline=True)
+    embed.add_field(name="Cargo de verificado", value=f"`{config['cargo_verificado']}`", inline=True)
+    embed.add_field(name="Cargos do painel de registro", value=cargos_txt, inline=False)
+    embed.set_footer(text=f"Arquivo salvo em: {ARQUIVO_CONFIG}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------- comandos manuais pra forçar um post novo (opcional) ----------
+@bot.tree.command(name="painel-registro", description="Força um novo post do painel de registro no canal atual")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def painel_registro(interaction: discord.Interaction):
     await interaction.response.send_message(embed=montar_embed_registro(), view=PainelRegistro())
 
 
-@bot.tree.command(
-    name="painel-regras",
-    description="Força um novo post do painel de regras com botão de verificação no canal atual",
-)
+@bot.tree.command(name="painel-regras", description="Força um novo post do painel de regras no canal atual")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def painel_regras(interaction: discord.Interaction):
     await interaction.response.send_message(embed=montar_embed_regras(), view=PainelRegras())
@@ -264,15 +469,22 @@ async def painel_regras(interaction: discord.Interaction):
 async def _erro_permissao(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "🐾 Só quem tem permissão de **Gerenciar Cargos** pode usar esse comando!",
-            ephemeral=True,
+            "🐾 Você não tem permissão suficiente pra usar esse comando!", ephemeral=True
         )
     else:
         raise error
 
 
-painel_registro.error(_erro_permissao)
-painel_regras.error(_erro_permissao)
+for _cmd in (
+    configurar_canal,
+    adicionar_cargo_registro,
+    remover_cargo_registro,
+    definir_cargo_verificado,
+    ver_configuracao,
+    painel_registro,
+    painel_regras,
+):
+    _cmd.error(_erro_permissao)
 
 
 # ============================================================
@@ -290,14 +502,17 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Erro ao sincronizar comandos: {e}")
 
-    # Posta os painéis automaticamente nos canais configurados (não duplica se já existirem)
-    await garantir_painel(bot.get_channel(CANAL_REGRAS_ID), PainelRegras(), montar_embed_regras())
-    await garantir_painel(bot.get_channel(CANAL_REGISTRO_ID), PainelRegistro(), montar_embed_registro())
+    # Posta/atualiza os painéis automaticamente nos canais configurados
+    await atualizar_ou_criar_painel(bot.get_channel(config["canal_regras_id"]), PainelRegras(), montar_embed_regras())
+    await atualizar_ou_criar_painel(
+        bot.get_channel(config["canal_registro_id"]), PainelRegistro(), montar_embed_registro()
+    )
 
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="os 3 portões 🐾")
     )
     print(f"🐕🐕🐕 Drax tá online como {bot.user}! Au au!")
+    print(f"💾 Configuração persistente em: {ARQUIVO_CONFIG.resolve()}")
 
 
 if __name__ == "__main__":
